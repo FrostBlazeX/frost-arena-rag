@@ -36,8 +36,7 @@ DOCUMENTS = [
     "Parking is free after 6pm in the rear car park, which has 40 spaces.",
 ]
 
-embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2")
+embed_fn = embedding_functions.DefaultEmbeddingFunction()
 chroma = chromadb.Client()
 collection = chroma.get_or_create_collection(
     "frost_arena", embedding_function=embed_fn)
