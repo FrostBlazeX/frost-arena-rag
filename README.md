@@ -1,13 +1,3 @@
----
-title: Frost Arena RAG
-emoji: 🍺
-colorFrom: blue
-colorTo: indigo
-sdk: docker
-app_port: 7860
-pinned: false
----
-
 # Frost Arena RAG
 
 A production-minded retrieval-augmented generation service that answers questions
