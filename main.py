@@ -44,9 +44,9 @@ if collection.count() == 0:
     collection.add(documents=DOCUMENTS, ids=[
                    f"doc{i}" for i in range(len(DOCUMENTS))])
 
-# Input guardrail threshold. Calibrated from real /search distances:
-# on-topic questions land ~0.30-0.41, off-topic ones ~0.87+. 0.6 sits in the gap.
-RELEVANCE_THRESHOLD = 0.6
+# Input guardrail threshold. Calibrated for the ONNX embedder from real /search
+# distances: on-topic ~0.61-0.66, off-topic ~1.86. 1.2 sits in the wide gap.
+RELEVANCE_THRESHOLD = 1.2
 
 # Input guardrail 2: injection / jailbreak detection via a policy classifier.
 # gpt-oss-20b classifies the user input against this policy and returns JSON.
