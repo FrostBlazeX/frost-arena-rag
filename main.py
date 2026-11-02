@@ -264,6 +264,8 @@ def ask(request: Request, q: str, k: int = 3):
             )
             answer = completion.choices[0].message.content
         except Exception as e:
+            print(
+                f"[GEN ERR] {type(e).__name__}: {e} | cause={getattr(e, '__cause__', None)!r}", flush=True)
             # OUTPUT GUARDRAIL: graceful fallback. A model/network failure returns a
             # safe message (HTTP 200) instead of a 500 with a stack trace.
             answer = ("Sorry, I'm having trouble answering right now. "
