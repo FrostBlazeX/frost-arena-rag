@@ -31,7 +31,8 @@ jobs:
       - name: Run the eval suite
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: npx promptfoo@latest eval -c promptfooconfig.yaml --no-cache -o results.json
+        # -j 1 serializes calls so the suite doesn't burst past Groq's rate limit
+        run: npx promptfoo@latest eval -c promptfooconfig.yaml --no-cache -j 1 -o results.json
 
       - name: Fail the build if any eval failed OR errored
         run: |
