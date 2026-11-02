@@ -3,7 +3,11 @@ from langfuse import get_client
 import os
 import re
 import json
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request, Depends, Security
+from fastapi.security import APIKeyHeader
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
@@ -23,6 +27,34 @@ client = OpenAI(
 
 app = FastAPI(title="Frost Arena RAG")
 
+
+# --- Rate limiting (per client IP, X-Forwarded-For aware behind Render/Cloudflare) ---
+def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    return fwd.split(",")[0].strip() if fwd else get_remote_address(request)
+
+
+limiter = Limiter(key_func=client_ip)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# --- API-key auth (optional): enforced only if API_KEY is set; open demo otherwise ---
+API_KEY = os.environ.get("API_KEY")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(key: str = Security(api_key_header)):
+    if not API_KEY:
+        return  # auth disabled (demo mode)
+    if key != API_KEY:
+        raise HTTPException(
+            status_code=401, detail="Invalid or missing API key")
+
+
+# --- Response cache (in-memory): identical (question, k) skips the whole pipeline ---
+_ASK_CACHE: dict[tuple, dict] = {}
+
 DOCUMENTS = [
     "The Frost Arena is a sports bar located at 26 Courtland Road, Oxford.",
     "The Frost Arena is open Mon-Thu 4pm-midnight, Fri-Sat noon-2am, and Sun noon-11pm.",
@@ -36,6 +68,8 @@ DOCUMENTS = [
     "Parking is free after 6pm in the rear car park, which has 40 spaces.",
 ]
 
+# ONNX build of all-MiniLM-L6-v2 (Chroma's default embedder): same model, no torch,
+# so it fits a 512MB free host. Was SentenceTransformerEmbeddingFunction.
 embed_fn = embedding_functions.DefaultEmbeddingFunction()
 chroma = chromadb.Client()
 collection = chroma.get_or_create_collection(
@@ -145,16 +179,26 @@ def redact_pii(text: str) -> str:
 
 
 @app.get("/search")
-def search(q: str, k: int = 3):
+@limiter.limit("30/minute")
+def search(request: Request, q: str, k: int = 3):
     results = collection.query(query_texts=[q], n_results=k)
     return [{"document": d, "distance": round(dist, 3)}
             for d, dist in zip(results["documents"][0], results["distances"][0])]
 
 
-@app.get("/ask")
-def ask(q: str, k: int = 3):
+@app.get("/ask", dependencies=[Depends(require_api_key)])
+@limiter.limit("20/minute")
+def ask(request: Request, q: str, k: int = 3):
     # One explicit parent span. Everything inside nests under it in a single trace.
     with langfuse.start_as_current_observation(as_type="span", name="ask") as trace:
+
+        # CACHE: identical (question, k) returns instantly, skipping retrieval,
+        # the guardrails, and generation. Only successful answers are cached.
+        cache_key = (q.strip().lower(), k)
+        if cache_key in _ASK_CACHE:
+            cached = _ASK_CACHE[cache_key]
+            trace.update(output=cached["answer"], metadata={"cache": "hit"})
+            return {**cached, "cached": True}
 
         # 1. RETRIEVE  (its own child span, so retrieval latency is visible separately)
         with langfuse.start_as_current_observation(as_type="span", name="retrieve") as r:
@@ -240,10 +284,13 @@ def ask(q: str, k: int = 3):
 
         # 4. annotate the parent with the clean (redacted) question/answer
         trace.update(input={"q": redact_pii(q), "k": k}, output=answer)
-        return {"question": q, "answer": answer, "sources": chunks}
+        response = {"question": q, "answer": answer, "sources": chunks}
+        _ASK_CACHE[cache_key] = response    # cache the successful answer
+        return response
 
 
 @app.get("/embed")
-def embed(q: str):
+@limiter.limit("30/minute")
+def embed(request: Request, q: str):
     vector = embed_fn([q])[0]
     return {"embedding": [float(x) for x in vector]}
