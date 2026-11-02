@@ -27,8 +27,12 @@ else:
 
 langfuse = get_client()
 
+# .strip() guards against a trailing newline/whitespace in the secret value.
+# A stray \n makes the openai client raise LocalProtocolError("Illegal header
+# value") when it builds the Authorization header, surfacing as an
+# APIConnectionError on every Groq call. See the CI eval-gate incident.
 client = OpenAI(
-    api_key=os.environ["GROQ_API_KEY"],
+    api_key=os.environ["GROQ_API_KEY"].strip(),
     base_url="https://api.groq.com/openai/v1",
 )
 
