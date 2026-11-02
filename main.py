@@ -106,6 +106,11 @@ INJECTION_POLICY = (
     'Respond with ONLY a JSON object: {"violation": 0 or 1, "reason": "<short reason>"}.'
 )
 INJECTION_MODEL = "openai/gpt-oss-20b"
+# Grounding is a nuanced grading task; the 20b model false-negatives on it (same
+# reason we moved the Promptfoo judge to 120b). The injection flag is a simpler
+# binary classification and stays on 20b. Trade-off: 120b adds latency/cost to the
+# /ask hot path, acceptable for a demo; a production system might cache or sample.
+GROUNDING_MODEL = "openai/gpt-oss-120b"
 
 
 def check_injection(q: str) -> dict:
@@ -154,7 +159,7 @@ def check_grounding(answer: str, chunks: list) -> dict:
         context = "\n".join(f"- {c}" for c in chunks)
         try:
             completion = client.chat.completions.create(
-                model=INJECTION_MODEL,
+                model=GROUNDING_MODEL,
                 messages=[
                     {"role": "system", "content": GROUNDING_POLICY},
                     {"role": "user",
@@ -284,6 +289,11 @@ def ask(request: Request, q: str, k: int = 3):
         # retrieved context, replace it rather than serve a possible hallucination.
         grounding = check_grounding(answer, chunks)
         if grounding.get("grounded") == 0:
+            # Diagnostic: proves whether retrieval surfaced the supporting chunk and
+            # what the model actually answered, so an ungrounded verdict tells us
+            # weak-checker-false-negative vs. real hallucination/retrieval-miss.
+            print(f"[UNGROUNDED] q={q!r} | reason={grounding.get('reason', '')!r} | "
+                  f"answer={answer!r} | chunks={chunks!r}", flush=True)
             safe = "I don't have enough information to answer that accurately."
             trace.update(output=safe,
                          metadata={"guardrail": "ungrounded",
