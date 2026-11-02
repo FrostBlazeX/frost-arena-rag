@@ -273,8 +273,6 @@ def ask(request: Request, q: str, k: int = 3):
             )
             answer = completion.choices[0].message.content
         except Exception as e:
-            print(
-                f"[GEN ERR] {type(e).__name__}: {e} | cause={getattr(e, '__cause__', None)!r}", flush=True)
             # OUTPUT GUARDRAIL: graceful fallback. A model/network failure returns a
             # safe message (HTTP 200) instead of a 500 with a stack trace.
             answer = ("Sorry, I'm having trouble answering right now. "
@@ -289,11 +287,6 @@ def ask(request: Request, q: str, k: int = 3):
         # retrieved context, replace it rather than serve a possible hallucination.
         grounding = check_grounding(answer, chunks)
         if grounding.get("grounded") == 0:
-            # Diagnostic: proves whether retrieval surfaced the supporting chunk and
-            # what the model actually answered, so an ungrounded verdict tells us
-            # weak-checker-false-negative vs. real hallucination/retrieval-miss.
-            print(f"[UNGROUNDED] q={q!r} | reason={grounding.get('reason', '')!r} | "
-                  f"answer={answer!r} | chunks={chunks!r}", flush=True)
             safe = "I don't have enough information to answer that accurately."
             trace.update(output=safe,
                          metadata={"guardrail": "ungrounded",
