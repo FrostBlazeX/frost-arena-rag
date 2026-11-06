@@ -29,7 +29,8 @@ embed_fn = embedding_functions.DefaultEmbeddingFunction()
 sb.table("documents").delete().gte("id", 0).execute()
 
 vectors = embed_fn(DOCUMENTS)
-rows = [{"content": doc, "embedding": [float(x) for x in vec]}
+rows = [{"content": doc, "embedding": [float(x) for x in vec],
+         "source": "frost_arena_seed"}
         for doc, vec in zip(DOCUMENTS, vectors)]
 sb.table("documents").insert(rows).execute()
 

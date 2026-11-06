@@ -10,6 +10,7 @@ from slowapi.errors import RateLimitExceeded
 import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
+from pydantic import BaseModel
 from kb import DOCUMENTS
 
 load_dotenv()
@@ -62,6 +63,23 @@ def require_api_key(key: str = Security(api_key_header)):
     if key != API_KEY:
         raise HTTPException(
             status_code=401, detail="Invalid or missing API key")
+
+
+# --- Write auth (separate from read): /ingest mutates the knowledge base, so it is
+# ALWAYS keyed, independently of the open /ask demo. Set INGEST_KEY to enable writes;
+# clients send it as X-Ingest-Key. Unset => ingestion is disabled, not open. ---
+INGEST_KEY = os.environ.get("INGEST_KEY")
+ingest_key_header = APIKeyHeader(name="X-Ingest-Key", auto_error=False)
+
+
+def require_ingest_key(key: str = Security(ingest_key_header)):
+    if not INGEST_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Ingestion disabled: set INGEST_KEY to enable the write endpoint.")
+    if key != INGEST_KEY:
+        raise HTTPException(
+            status_code=401, detail="Invalid or missing ingest key")
 
 
 # --- Response cache (in-memory): identical (question, k) skips the whole pipeline ---
@@ -339,3 +357,64 @@ def ask(request: Request, q: str, k: int = 3):
 def embed(request: Request, q: str):
     vector = embed_fn([q])[0]
     return {"embedding": [float(x) for x in vector]}
+
+
+def chunk_text(text: str, max_chars: int = 500) -> list[str]:
+    """Pack paragraphs into chunks up to max_chars; hard-split any single
+    paragraph longer than that. Short docs (one line) stay a single chunk."""
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    chunks: list[str] = []
+    current = ""
+    for para in paragraphs:
+        if len(current) + len(para) + 1 <= max_chars:
+            current = f"{current} {para}".strip()
+            continue
+        if current:
+            chunks.append(current)
+        while len(para) > max_chars:          # a single oversized paragraph
+            chunks.append(para[:max_chars])
+            para = para[max_chars:]
+        current = para
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+class IngestRequest(BaseModel):
+    text: str
+    source: str        # identifies the document; re-ingesting a source replaces it
+
+
+@app.post("/ingest", dependencies=[Depends(require_ingest_key)])
+@limiter.limit("10/minute")
+def ingest(request: Request, body: IngestRequest):
+    """Add/replace a document in the knowledge base. Chunks the text, embeds each
+    chunk with the SAME embedder the queries use, and upserts into Supabase.
+    Idempotent per source: existing chunks for that source are removed first, so
+    re-sending a document never duplicates it. Supabase-only (the Chroma fallback
+    is ephemeral)."""
+    if not USE_SUPABASE:
+        raise HTTPException(
+            status_code=503,
+            detail="Ingestion requires the Supabase backend "
+                   "(set SUPABASE_URL and SUPABASE_SECRET_KEY).")
+
+    chunks = chunk_text(body.text)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No text to ingest.")
+
+    with langfuse.start_as_current_observation(as_type="span", name="ingest") as span:
+        # idempotent: drop any existing chunks from this source before re-adding
+        supabase.table("documents").delete().eq(
+            "source", body.source).execute()
+        vectors = embed_fn(chunks)
+        rows = [{"content": c, "embedding": [float(x) for x in v],
+                 "source": body.source} for c, v in zip(chunks, vectors)]
+        supabase.table("documents").insert(rows).execute()
+        # The knowledge base just changed, so previously cached answers may now be
+        # stale — clear the response cache so the next /ask re-retrieves.
+        _ASK_CACHE.clear()
+        span.update(input={"source": body.source, "chars": len(body.text)},
+                    output={"chunks": len(rows)})
+
+    return {"source": body.source, "chunks": len(rows)}
