@@ -10,6 +10,7 @@ from slowapi.errors import RateLimitExceeded
 import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
+from kb import DOCUMENTS
 
 load_dotenv()
 
@@ -66,32 +67,54 @@ def require_api_key(key: str = Security(api_key_header)):
 # --- Response cache (in-memory): identical (question, k) skips the whole pipeline ---
 _ASK_CACHE: dict[tuple, dict] = {}
 
-DOCUMENTS = [
-    "The Frost Arena is a sports bar located at 26 Courtland Road, Oxford.",
-    "The Frost Arena is open Mon-Thu 4pm-midnight, Fri-Sat noon-2am, and Sun noon-11pm.",
-    "Happy hour runs every weekday from 5pm to 7pm, with 2-for-1 on draught beer and house cocktails.",
-    "The Frost Arena has 18 big screens and two 4-metre projector walls, showing Premier League, NBA, UFC, and Formula 1.",
-    "VIP booths seat up to 8 people and cost £120 to reserve on match days, including a £60 food and drink credit.",
-    "Membership is £25 per month and includes priority booking, 10% off food, and a free drink on your birthday.",
-    "The kitchen serves wings, loaded fries, burgers, and vegan options until 10pm every day.",
-    "Under-18s are welcome until 8pm when accompanied by an adult.",
-    "There is a weekly quiz night every Wednesday at 7:30pm, with a £50 bar-tab prize.",
-    "Parking is free after 6pm in the rear car park, which has 40 spaces.",
-]
-
-# ONNX build of all-MiniLM-L6-v2 (Chroma's default embedder): same model, no torch,
-# so it fits a 512MB free host. Was SentenceTransformerEmbeddingFunction.
+# ONNX build of all-MiniLM-L6-v2 (Chroma's default embedder): same model, no
+# torch, so it fits a 512MB free host. We KEEP it as the embedder even after
+# moving the vector STORE to Supabase, so stored embeddings stay identical.
 embed_fn = embedding_functions.DefaultEmbeddingFunction()
-chroma = chromadb.Client()
-collection = chroma.get_or_create_collection(
-    "frost_arena", embedding_function=embed_fn)
-if collection.count() == 0:
-    collection.add(documents=DOCUMENTS, ids=[
-                   f"doc{i}" for i in range(len(DOCUMENTS))])
 
-# Input guardrail threshold. Calibrated for the ONNX embedder from real /search
-# distances: on-topic ~0.61-0.66, off-topic ~1.86. 1.2 sits in the wide gap.
-RELEVANCE_THRESHOLD = 1.2
+# Vector store backend. Production uses Supabase pgvector (set SUPABASE_URL +
+# SUPABASE_SECRET_KEY). Without them (local dev, CI) we fall back to an in-memory
+# Chroma collection configured for COSINE distance — the SAME scale pgvector's
+# <=> operator returns — so one RELEVANCE_THRESHOLD fits both backends.
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SECRET_KEY)
+
+if USE_SUPABASE:
+    from supabase import create_client
+    supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+    collection = None
+else:
+    chroma = chromadb.Client()
+    collection = chroma.get_or_create_collection(
+        "frost_arena", embedding_function=embed_fn,
+        metadata={"hnsw:space": "cosine"})
+    if collection.count() == 0:
+        collection.add(documents=DOCUMENTS,
+                       ids=[f"doc{i}" for i in range(len(DOCUMENTS))])
+
+
+def retrieve(q: str, k: int):
+    """Return (chunks, distances) from the active backend. Distances are COSINE
+    distance either way, so the relevance threshold is backend-independent."""
+    if USE_SUPABASE:
+        qvec = [float(x) for x in embed_fn([q])[0]]
+        resp = supabase.rpc(
+            "match_documents",
+            {"query_embedding": qvec, "match_count": k}).execute()
+        rows = resp.data or []
+        return [r["content"] for r in rows], [r["distance"] for r in rows]
+    results = collection.query(query_texts=[q], n_results=k)
+    return results["documents"][0], results["distances"][0]
+
+
+# Input guardrail threshold — now COSINE distance (pgvector <=> and Chroma's
+# cosine space return the same scale). DERIVED from the old squared-L2
+# calibration: L2^2 = 2*(1 - cos), so cosine = L2^2 / 2. The old 1.2 -> 0.6;
+# old on-topic ~0.61-0.66 -> ~0.31, off-topic ~1.86 -> ~0.93, so 0.6 still sits
+# in the gap. VERIFY against real /search distances once deployed (that is how
+# 1.2 was originally set) and nudge if a real query lands near the line.
+RELEVANCE_THRESHOLD = 0.6
 
 # Input guardrail 2: injection / jailbreak detection via a policy classifier.
 # gpt-oss-20b classifies the user input against this policy and returns JSON.
@@ -197,9 +220,9 @@ def redact_pii(text: str) -> str:
 @app.get("/search")
 @limiter.limit("30/minute")
 def search(request: Request, q: str, k: int = 3):
-    results = collection.query(query_texts=[q], n_results=k)
+    chunks, distances = retrieve(q, k)
     return [{"document": d, "distance": round(dist, 3)}
-            for d, dist in zip(results["documents"][0], results["distances"][0])]
+            for d, dist in zip(chunks, distances)]
 
 
 @app.get("/ask", dependencies=[Depends(require_api_key)])
@@ -218,9 +241,7 @@ def ask(request: Request, q: str, k: int = 3):
 
         # 1. RETRIEVE  (its own child span, so retrieval latency is visible separately)
         with langfuse.start_as_current_observation(as_type="span", name="retrieve") as r:
-            results = collection.query(query_texts=[q], n_results=k)
-            chunks = results["documents"][0]
-            distances = results["distances"][0]
+            chunks, distances = retrieve(q, k)
             r.update(input={"q": q, "k": k},
                      output={"chunks": chunks, "distances": distances})
 
@@ -228,7 +249,8 @@ def ask(request: Request, q: str, k: int = 3):
         # If even the closest document is beyond the threshold, the question is
         # off-topic. Reject here, before (and instead of) calling the model:
         # cheaper and safer than letting the LLM field an irrelevant question.
-        best_distance = distances[0]
+        # Empty retrieval (no docs) is treated as off-topic, not a crash.
+        best_distance = distances[0] if distances else float("inf")
         if best_distance > RELEVANCE_THRESHOLD:
             answer = "I can only answer questions about The Frost Arena."
             trace.update(
@@ -273,6 +295,8 @@ def ask(request: Request, q: str, k: int = 3):
             )
             answer = completion.choices[0].message.content
         except Exception as e:
+            print(
+                f"[GEN ERR] {type(e).__name__}: {e} | cause={getattr(e, '__cause__', None)!r}", flush=True)
             # OUTPUT GUARDRAIL: graceful fallback. A model/network failure returns a
             # safe message (HTTP 200) instead of a 500 with a stack trace.
             answer = ("Sorry, I'm having trouble answering right now. "
@@ -287,6 +311,11 @@ def ask(request: Request, q: str, k: int = 3):
         # retrieved context, replace it rather than serve a possible hallucination.
         grounding = check_grounding(answer, chunks)
         if grounding.get("grounded") == 0:
+            # Diagnostic: proves whether retrieval surfaced the supporting chunk and
+            # what the model actually answered, so an ungrounded verdict tells us
+            # weak-checker-false-negative vs. real hallucination/retrieval-miss.
+            print(f"[UNGROUNDED] q={q!r} | reason={grounding.get('reason', '')!r} | "
+                  f"answer={answer!r} | chunks={chunks!r}", flush=True)
             safe = "I don't have enough information to answer that accurately."
             trace.update(output=safe,
                          metadata={"guardrail": "ungrounded",
