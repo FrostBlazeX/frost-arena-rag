@@ -1,17 +1,3 @@
-# promptfooconfig.yaml  (place in week-2-search/, next to main.py and pf_embeddings.js)
-# Month 3 - Week 1: Frost Arena RAG eval (/ask)
-# Each metric used where it fits: regex/icontains for exact facts, similar for
-# topical prose, llm-rubric for open-ended QUALITY judgments (quiz night), and a
-# deterministic string match (icontains-any) for the canned guardrail refusals.
-# The rule of thumb: an LLM judge earns its keep only when the output is
-# variable; grading a fixed string with one just adds flakiness and token cost.
-# (icontains-any is a plain string op — no regex engine, so no JS-vs-Python
-# flavour surprises like an unsupported (?i) inline flag.)
-#
-# NOTE: the app generates with gpt-oss-20b, but the llm-rubric JUDGE uses a larger
-# model (openai/gpt-oss-120b). A weak judge produces false negatives; the
-# evaluator should be more reliable than the system it grades.
-
 description: "Month3 W1 - Frost Arena RAG eval (/ask)"
 
 providers:
