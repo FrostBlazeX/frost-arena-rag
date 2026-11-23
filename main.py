@@ -89,16 +89,42 @@ else:
 
 
 def retrieve(q: str, k: int):
-    
+
     if USE_SUPABASE:
         qvec = [float(x) for x in embed_fn([q])[0]]
-        resp = supabase.rpc(
+        dense = supabase.rpc(
             "match_documents",
-            {"query_embedding": qvec, "match_count": k}).execute()
-        rows = resp.data or []
-        return [r["content"] for r in rows], [r["distance"] for r in rows]
+            {"query_embedding": qvec, "match_count": DENSE_CANDIDATES}).execute().data or []
+        keyword = supabase.rpc(
+            "match_documents_text",
+            {"query_text": q, "match_count": KEYWORD_CANDIDATES}).execute().data or []
+        best_distance = dense[0]["distance"] if dense else float("inf")
+        chunks, scores = _rrf_fuse(dense, keyword, k)
+        return chunks, scores, best_distance
     results = collection.query(query_texts=[q], n_results=k)
-    return results["documents"][0], results["distances"][0]
+    chunks, distances = results["documents"][0], results["distances"][0]
+    best_distance = distances[0] if distances else float("inf")
+    return chunks, distances, best_distance
+
+
+# --- Hybrid retrieval: dense + keyword, fused with Reciprocal Rank Fusion ---
+RRF_K = 60
+DENSE_CANDIDATES = 20     # dense is the broad semantic retriever
+KEYWORD_CANDIDATES = 5    # keyword is a targeted exact-match rescue, not a broad net
+
+
+def _rrf_fuse(dense: list, keyword: list, k: int):
+    """Fuse two ranked lists by RRF on document id. Each list contributes
+    1/(RRF_K + rank); higher total = better. Returns (chunks, scores) top-k."""
+    scores: dict = {}
+    content: dict = {}
+    for ranked_list in (dense, keyword):
+        for rank, row in enumerate(ranked_list, start=1):
+            rid = row["id"]
+            scores[rid] = scores.get(rid, 0.0) + 1.0 / (RRF_K + rank)
+            content[rid] = row["content"]
+    top = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]
+    return [content[rid] for rid, _ in top], [s for _, s in top]
 
 
 RELEVANCE_THRESHOLD = 0.6
@@ -189,9 +215,8 @@ def redact_pii(text: str) -> str:
 @app.get("/search")
 @limiter.limit("30/minute")
 def search(request: Request, q: str, k: int = 3):
-    chunks, distances = retrieve(q, k)
-    return [{"document": d, "distance": round(dist, 3)}
-            for d, dist in zip(chunks, distances)]
+    chunks, scores, _ = retrieve(q, k)
+    return [{"document": d, "score": round(s, 4)} for d, s in zip(chunks, scores)]
 
 
 @app.get("/ask", dependencies=[Depends(require_api_key)])
@@ -206,11 +231,10 @@ def ask(request: Request, q: str, k: int = 3):
             return {**cached, "cached": True}
 
         with langfuse.start_as_current_observation(as_type="span", name="retrieve") as r:
-            chunks, distances = retrieve(q, k)
+            chunks, scores, best_distance = retrieve(q, k)
             r.update(input={"q": q, "k": k},
-                     output={"chunks": chunks, "distances": distances})
+                     output={"chunks": chunks, "scores": scores})
 
-        best_distance = distances[0] if distances else float("inf")
         if best_distance > RELEVANCE_THRESHOLD:
             answer = "I can only answer questions about The Frost Arena."
             trace.update(
@@ -253,7 +277,7 @@ def ask(request: Request, q: str, k: int = 3):
         except Exception as e:
             print(
                 f"[GEN ERR] {type(e).__name__}: {e} | cause={getattr(e, '__cause__', None)!r}", flush=True)
-            
+
             answer = ("Sorry, I'm having trouble answering right now. "
                       "Please try again in a moment.")
             trace.update(output=answer,
@@ -262,10 +286,9 @@ def ask(request: Request, q: str, k: int = 3):
             return {"question": q, "answer": answer,
                     "sources": chunks, "degraded": True}
 
-        
         grounding = check_grounding(answer, chunks)
         if grounding.get("grounded") == 0:
-            
+
             print(f"[UNGROUNDED] q={q!r} | reason={grounding.get('reason', '')!r} | "
                   f"answer={answer!r} | chunks={chunks!r}", flush=True)
             safe = "I don't have enough information to answer that accurately."
@@ -279,7 +302,7 @@ def ask(request: Request, q: str, k: int = 3):
 
         trace.update(input={"q": redact_pii(q), "k": k}, output=answer)
         response = {"question": q, "answer": answer, "sources": chunks}
-        _ASK_CACHE[cache_key] = response    
+        _ASK_CACHE[cache_key] = response
         return response
 
 
@@ -291,7 +314,7 @@ def embed(request: Request, q: str):
 
 
 def chunk_text(text: str, max_chars: int = 500) -> list[str]:
-    
+
     paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
     chunks: list[str] = []
     current = ""
@@ -301,7 +324,7 @@ def chunk_text(text: str, max_chars: int = 500) -> list[str]:
             continue
         if current:
             chunks.append(current)
-        while len(para) > max_chars:          
+        while len(para) > max_chars:
             chunks.append(para[:max_chars])
             para = para[max_chars:]
         current = para
@@ -312,13 +335,13 @@ def chunk_text(text: str, max_chars: int = 500) -> list[str]:
 
 class IngestRequest(BaseModel):
     text: str
-    source: str        
+    source: str
 
 
 @app.post("/ingest", dependencies=[Depends(require_ingest_key)])
 @limiter.limit("10/minute")
 def ingest(request: Request, body: IngestRequest):
-    
+
     if not USE_SUPABASE:
         raise HTTPException(
             status_code=503,
@@ -336,7 +359,7 @@ def ingest(request: Request, body: IngestRequest):
         rows = [{"content": c, "embedding": [float(x) for x in v],
                  "source": body.source} for c, v in zip(chunks, vectors)]
         supabase.table("documents").insert(rows).execute()
-       
+
         _ASK_CACHE.clear()
         span.update(input={"source": body.source, "chars": len(body.text)},
                     output={"chunks": len(rows)})
