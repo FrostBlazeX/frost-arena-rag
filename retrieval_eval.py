@@ -1,34 +1,3 @@
-"""
-retrieval_eval.py — Month 4 / Week 1: retrieval-quality baseline for frost-arena-rag.
-
-Measures the retriever two ways, over two groups of queries:
-
-  - hit_rate@k : fraction of queries where the right doc is in the top-k
-  - MRR        : mean reciprocal rank of the first correct doc (0 if not found)
-
-  EASY group: clean, mostly-semantic questions. Dense retrieval is near its
-              ceiling here, so hybrid has little to add — expected.
-  HARD group: queries that hinge on an exact token (a tier code, a proper noun,
-              an ID like "Screen 12") sitting among near-identical distractors.
-              This is where dense blurs and BM25/hybrid earns its keep.
-
-Run it on the current (dense-only) retriever for the baseline, then again after
-hybrid + RRF. The HARD-group delta is the real Week 1 result.
-
-USAGE
-    # local: uvicorn main:app --host 127.0.0.1 --port 8000   (in another shell)
-    python -I retrieval_eval.py
-    # or against the deployed instance:
-    RAG_BASE_URL=https://frost-arena-rag.onrender.com python -I retrieval_eval.py
-
-NOTE: the HARD cases target the Month 4 docs added to kb.py. Make sure those
-docs are loaded wherever you point this: locally the Chroma fallback re-seeds
-from kb.py on restart; for the deployed instance, re-run migrate_to_supabase.py.
-
-/search contract (from main.py):
-    GET /search?q=<question>&k=<n>  ->  [{"document": "<text>", "distance": <float>}, ...]
-"""
-
 import json
 import os
 import sys
@@ -100,7 +69,6 @@ def search(query, k):
 
 
 def first_hit_rank(results, expect):
-    """1-based rank of the first doc containing `expect`, or None."""
     needle = expect.lower()
     for i, row in enumerate(results, start=1):
         if needle in (row.get("document", "") or "").lower():
@@ -109,7 +77,6 @@ def first_hit_rank(results, expect):
 
 
 def summarise(rows, label):
-    """rows: list of (rank_or_None). Print hit_rate@k and MRR for this group."""
     n = len(rows)
     if not n:
         return
@@ -125,7 +92,6 @@ def summarise(rows, label):
 def main():
     print(f"Retrieval eval → {BASE_URL}  (k={K})\n")
     try:
-        # wake Render's free tier / fail fast if the API is down
         search("warmup", 1)
     except Exception as e:
         print(

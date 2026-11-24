@@ -88,34 +88,38 @@ else:
                        ids=[f"doc{i}" for i in range(len(DOCUMENTS))])
 
 
-def retrieve(q: str, k: int):
-
+def _retrieve_pool(q: str):
+    """Hybrid recall pool, no re-rank. Returns (pool_chunks, best_distance)."""
     if USE_SUPABASE:
         qvec = [float(x) for x in embed_fn([q])[0]]
-        dense = supabase.rpc(
-            "match_documents",
-            {"query_embedding": qvec, "match_count": DENSE_CANDIDATES}).execute().data or []
-        keyword = supabase.rpc(
-            "match_documents_text",
-            {"query_text": q, "match_count": KEYWORD_CANDIDATES}).execute().data or []
+        dense = supabase.rpc("match_documents",
+                             {"query_embedding": qvec, "match_count": DENSE_CANDIDATES}).execute().data or []
+        keyword = supabase.rpc("match_documents_text",
+                               {"query_text": q, "match_count": KEYWORD_CANDIDATES}).execute().data or []
         best_distance = dense[0]["distance"] if dense else float("inf")
-        chunks, scores = _rrf_fuse(dense, keyword, k)
-        return chunks, scores, best_distance
-    results = collection.query(query_texts=[q], n_results=k)
+        pool, _ = _rrf_fuse(dense, keyword, RERANK_POOL)
+        return pool, best_distance
+    results = collection.query(query_texts=[q], n_results=RERANK_POOL)
     chunks, distances = results["documents"][0], results["distances"][0]
-    best_distance = distances[0] if distances else float("inf")
-    return chunks, distances, best_distance
+    return chunks, (distances[0] if distances else float("inf"))
+
+
+def retrieve(q: str, k: int):
+    pool, best_distance = _retrieve_pool(q)
+    reranked = rerank(q, pool, k) if (USE_SUPABASE and pool) else pool[:k]
+    return reranked, list(range(1, len(reranked) + 1)), best_distance
 
 
 # --- Hybrid retrieval: dense + keyword, fused with Reciprocal Rank Fusion ---
 RRF_K = 60
-DENSE_CANDIDATES = 20     # dense is the broad semantic retriever
-KEYWORD_CANDIDATES = 5    # keyword is a targeted exact-match rescue, not a broad net
+DENSE_CANDIDATES = 30
+KEYWORD_CANDIDATES = 10
+RERANK_POOL = 30
+RERANK_MODEL = "openai/gpt-oss-20b"
 
 
 def _rrf_fuse(dense: list, keyword: list, k: int):
-    """Fuse two ranked lists by RRF on document id. Each list contributes
-    1/(RRF_K + rank); higher total = better. Returns (chunks, scores) top-k."""
+
     scores: dict = {}
     content: dict = {}
     for ranked_list in (dense, keyword):
@@ -198,6 +202,49 @@ def check_grounding(answer: str, chunks: list) -> dict:
         return verdict
 
 
+RERANK_SYSTEM = (
+    "You are a search reranker. Given a QUESTION and a numbered list of candidate "
+    "passages, return the passages most relevant to answering the question, best "
+    "first, by their numbers. Judge relevance to THIS question only. "
+    'Respond with ONLY JSON: {"ranking": [passage numbers, most relevant first]}.'
+)
+
+
+def rerank(q: str, candidates: list, k: int) -> list:
+    """LLM listwise rerank of `candidates` (content strings) → top-k.
+    Fails OPEN: on any error, falls back to the retrieval order (candidates[:k])."""
+    if not candidates:
+        return []
+    with langfuse.start_as_current_observation(as_type="span", name="rerank") as span:
+        numbered = "\n".join(f"[{i}] {c}" for i, c in enumerate(candidates))
+        try:
+            completion = client.chat.completions.create(
+                model=RERANK_MODEL,
+                messages=[
+                    {"role": "system", "content": RERANK_SYSTEM},
+                    {"role": "user", "content": f"QUESTION: {q}\n\nPASSAGES:\n{numbered}"},
+                ],
+                temperature=0,
+            )
+            raw = completion.choices[0].message.content or ""
+            order = json.loads(
+                raw[raw.find("{"):raw.rfind("}") + 1]).get("ranking", [])
+            seen, reranked = set(), []
+            for i in order:                       # take the LLM's order, validated
+                if isinstance(i, int) and 0 <= i < len(candidates) and i not in seen:
+                    seen.add(i)
+                    reranked.append(candidates[i])
+            for i, c in enumerate(candidates):    # backfill anything it dropped
+                if i not in seen:
+                    reranked.append(c)
+            span.update(input={"q": q, "n": len(candidates)},
+                        output={"kept": reranked[:k]})
+            return reranked[:k]
+        except Exception as e:
+            span.update(metadata={"rerank_error": str(e)[:200]})
+            return candidates[:k]
+
+
 PII_PATTERNS = {
     "[REDACTED_EMAIL]": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
     "[REDACTED_PHONE]": re.compile(r"(?:\+44\s?|0)\d[\d\s-]{7,}\d"),
@@ -222,7 +269,9 @@ def search(request: Request, q: str, k: int = 3):
 @app.get("/ask", dependencies=[Depends(require_api_key)])
 @limiter.limit("20/minute")
 def ask(request: Request, q: str, k: int = 3):
-    with langfuse.start_as_current_observation(as_type="span", name="ask") as trace:
+    with langfuse.start_as_current_observation(
+        as_type="span", name="ask"
+    ) as trace:
 
         cache_key = (q.strip().lower(), k)
         if cache_key in _ASK_CACHE:
@@ -230,31 +279,50 @@ def ask(request: Request, q: str, k: int = 3):
             trace.update(output=cached["answer"], metadata={"cache": "hit"})
             return {**cached, "cached": True}
 
-        with langfuse.start_as_current_observation(as_type="span", name="retrieve") as r:
-            chunks, scores, best_distance = retrieve(q, k)
-            r.update(input={"q": q, "k": k},
-                     output={"chunks": chunks, "scores": scores})
+        with langfuse.start_as_current_observation(
+            as_type="span", name="retrieve"
+        ) as r:
+            pool, best_distance = _retrieve_pool(q)
+            r.update(
+                input={"q": q, "k": k},
+                output={"pool": pool},
+            )
 
         if best_distance > RELEVANCE_THRESHOLD:
             answer = "I can only answer questions about The Frost Arena."
             trace.update(
                 output=answer,
-                metadata={"guardrail": "off_topic",
-                          "best_distance": round(best_distance, 3)},
+                metadata={
+                    "guardrail": "off_topic",
+                    "best_distance": round(best_distance, 3),
+                },
             )
-            return {"question": q, "answer": answer,
-                    "sources": [], "rejected": "off_topic"}
+            return {
+                "question": q,
+                "answer": answer,
+                "sources": [],
+                "rejected": "off_topic",
+            }
 
         verdict = check_injection(q)
         if verdict.get("violation") == 1:
             answer = "Sorry, I can't help with that request."
             trace.update(
                 output=answer,
-                metadata={"guardrail": "injection",
-                          "reason": verdict.get("reason", "")},
+                metadata={
+                    "guardrail": "injection",
+                    "reason": verdict.get("reason", ""),
+                },
             )
-            return {"question": q, "answer": answer,
-                    "sources": [], "rejected": "injection"}
+            return {
+                "question": q,
+                "answer": answer,
+                "sources": [],
+                "rejected": "injection",
+            }
+
+        # Rerank the candidate pool after both guardrails pass.
+        chunks = rerank(q, pool, k)
 
         # 2. AUGMENT
         context = "\n".join(f"- {c}" for c in chunks)
@@ -274,34 +342,70 @@ def ask(request: Request, q: str, k: int = 3):
                 temperature=0.2,
             )
             answer = completion.choices[0].message.content
+
         except Exception as e:
             print(
-                f"[GEN ERR] {type(e).__name__}: {e} | cause={getattr(e, '__cause__', None)!r}", flush=True)
+                f"[GEN ERR] {type(e).__name__}: {e} | "
+                f"cause={getattr(e, '__cause__', None)!r}",
+                flush=True,
+            )
 
-            answer = ("Sorry, I'm having trouble answering right now. "
-                      "Please try again in a moment.")
-            trace.update(output=answer,
-                         metadata={"guardrail": "generation_error",
-                                   "error": str(e)[:200]})
-            return {"question": q, "answer": answer,
-                    "sources": chunks, "degraded": True}
+            answer = (
+                "Sorry, I'm having trouble answering right now. "
+                "Please try again in a moment."
+            )
+            trace.update(
+                output=answer,
+                metadata={
+                    "guardrail": "generation_error",
+                    "error": str(e)[:200],
+                },
+            )
+            return {
+                "question": q,
+                "answer": answer,
+                "sources": chunks,
+                "degraded": True,
+            }
 
         grounding = check_grounding(answer, chunks)
-        if grounding.get("grounded") == 0:
 
-            print(f"[UNGROUNDED] q={q!r} | reason={grounding.get('reason', '')!r} | "
-                  f"answer={answer!r} | chunks={chunks!r}", flush=True)
+        if grounding.get("grounded") == 0:
+            print(
+                f"[UNGROUNDED] q={q!r} | "
+                f"reason={grounding.get('reason', '')!r} | "
+                f"answer={answer!r} | chunks={chunks!r}",
+                flush=True,
+            )
+
             safe = "I don't have enough information to answer that accurately."
-            trace.update(output=safe,
-                         metadata={"guardrail": "ungrounded",
-                                   "reason": grounding.get("reason", "")})
-            return {"question": q, "answer": safe,
-                    "sources": chunks, "rejected": "ungrounded"}
+            trace.update(
+                output=safe,
+                metadata={
+                    "guardrail": "ungrounded",
+                    "reason": grounding.get("reason", ""),
+                },
+            )
+            return {
+                "question": q,
+                "answer": safe,
+                "sources": chunks,
+                "rejected": "ungrounded",
+            }
 
         answer = redact_pii(answer)
 
-        trace.update(input={"q": redact_pii(q), "k": k}, output=answer)
-        response = {"question": q, "answer": answer, "sources": chunks}
+        trace.update(
+            input={"q": redact_pii(q), "k": k},
+            output=answer,
+        )
+
+        response = {
+            "question": q,
+            "answer": answer,
+            "sources": chunks,
+        }
+
         _ASK_CACHE[cache_key] = response
         return response
 

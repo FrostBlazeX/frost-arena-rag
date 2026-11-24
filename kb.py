@@ -1,22 +1,3 @@
-"""The Frost Arena knowledge base — single source of truth.
-
-Imported by both main.py (the Chroma fallback seeds from it) and
-migrate_to_supabase.py (loads it into pgvector), so the app and the migration
-can never drift out of sync.
-
-Two layers:
-  CURATED       — the hand-written venue facts (clean, semantic, one fact each).
-  OPERATIONAL   — a generated load of realistic records (bookings, staff, menu,
-                  members, rooms), each keyed by an OPAQUE id in a crowd of
-                  near-identical siblings. Deterministic (fixed seed), so every
-                  import and every migration produces the identical corpus.
-
-The operational layer exists to create honest retrieval difficulty: dense
-embeddings blur one opaque id among ~90 look-alike records, which is where
-hybrid (dense + keyword + RRF) starts to win. A handful of ANCHOR records have
-FIXED ids so the eval suite can target them by id.
-"""
-
 import random
 
 CURATED = [
