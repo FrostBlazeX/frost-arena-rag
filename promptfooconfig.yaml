@@ -1,9 +1,14 @@
-description: "Month3 W1 - Frost Arena RAG eval (/ask)"
+# promptfooconfig.yaml — Frost Arena RAG eval (/ask), blocking CI gate.
+# Each metric used where it fits (see EVAL_README.md).
+
+description: "Month3 - Frost Arena RAG eval (/ask)"
 
 providers:
   - id: https
     label: frost-rag
     config:
+      # Local + CI target — the eval starts the API on 127.0.0.1:8000
+      # (see .github/workflows/eval.yml). Override for a remote target if needed.
       url: "http://127.0.0.1:8000/ask"
       method: GET
       queryParams:
