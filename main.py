@@ -4,6 +4,7 @@ import re
 import json
 from fastapi import FastAPI, HTTPException, Request, Depends, Security
 from fastapi.security import APIKeyHeader
+from fastapi.responses import StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -266,18 +267,28 @@ def search(request: Request, q: str, k: int = 3):
     return [{"document": d, "score": round(s, 4)} for d, s in zip(chunks, scores)]
 
 
-@app.get("/ask", dependencies=[Depends(require_api_key)])
-@limiter.limit("20/minute")
-def ask(request: Request, q: str, k: int = 3):
+def ask_pipeline(q: str, k: int = 3):
     with langfuse.start_as_current_observation(
         as_type="span", name="ask"
     ) as trace:
 
         cache_key = (q.strip().lower(), k)
+
+        # Cache hit: no pipeline steps need to run.
         if cache_key in _ASK_CACHE:
             cached = _ASK_CACHE[cache_key]
-            trace.update(output=cached["answer"], metadata={"cache": "hit"})
-            return {**cached, "cached": True}
+            trace.update(
+                output=cached["answer"],
+                metadata={"cache": "hit"},
+            )
+            yield {"event": "result", "data": {**cached, "cached": True}}
+            return
+
+        # 1. RETRIEVE
+        yield {
+            "event": "step",
+            "data": {"id": "retrieve", "status": "started"},
+        }
 
         with langfuse.start_as_current_observation(
             as_type="span", name="retrieve"
@@ -288,8 +299,24 @@ def ask(request: Request, q: str, k: int = 3):
                 output={"pool": pool},
             )
 
+        yield {
+            "event": "step",
+            "data": {
+                "id": "retrieve",
+                "status": "completed",
+                "passages": len(pool),
+            },
+        }
+
+        # 2. CHECK QUESTION
+        yield {
+            "event": "step",
+            "data": {"id": "check_question", "status": "started"},
+        }
+
         if best_distance > RELEVANCE_THRESHOLD:
             answer = "I can only answer questions about The Frost Arena."
+
             trace.update(
                 output=answer,
                 metadata={
@@ -297,16 +324,31 @@ def ask(request: Request, q: str, k: int = 3):
                     "best_distance": round(best_distance, 3),
                 },
             )
-            return {
+
+            response = {
                 "question": q,
                 "answer": answer,
                 "sources": [],
                 "rejected": "off_topic",
             }
 
+            yield {
+                "event": "step",
+                "data": {
+                    "id": "check_question",
+                    "status": "completed",
+                    "outcome": "rejected",
+                    "reason": "off_topic",
+                },
+            }
+            yield {"event": "result", "data": response}
+            return
+
         verdict = check_injection(q)
+
         if verdict.get("violation") == 1:
             answer = "Sorry, I can't help with that request."
+
             trace.update(
                 output=answer,
                 metadata={
@@ -314,18 +356,46 @@ def ask(request: Request, q: str, k: int = 3):
                     "reason": verdict.get("reason", ""),
                 },
             )
-            return {
+
+            response = {
                 "question": q,
                 "answer": answer,
                 "sources": [],
                 "rejected": "injection",
             }
 
-        # Rerank the candidate pool after both guardrails pass.
+            yield {
+                "event": "step",
+                "data": {
+                    "id": "check_question",
+                    "status": "completed",
+                    "outcome": "rejected",
+                    "reason": "injection",
+                },
+            }
+            yield {"event": "result", "data": response}
+            return
+
+        yield {
+            "event": "step",
+            "data": {
+                "id": "check_question",
+                "status": "completed",
+                "outcome": "passed",
+            },
+        }
+
+        # 3. GENERATE
+        yield {
+            "event": "step",
+            "data": {"id": "generate", "status": "started"},
+        }
+
+        # Rerank after both question guardrails pass.
         chunks = rerank(q, pool, k)
 
-        # 2. AUGMENT
         context = "\n".join(f"- {c}" for c in chunks)
+
         system_prompt = (
             "You answer questions about The Frost Arena using ONLY the context provided. "
             "If the answer is not in the context, say you don't know. Never invent facts."
@@ -354,6 +424,7 @@ def ask(request: Request, q: str, k: int = 3):
                 "Sorry, I'm having trouble answering right now. "
                 "Please try again in a moment."
             )
+
             trace.update(
                 output=answer,
                 metadata={
@@ -361,12 +432,35 @@ def ask(request: Request, q: str, k: int = 3):
                     "error": str(e)[:200],
                 },
             )
-            return {
+
+            response = {
                 "question": q,
                 "answer": answer,
                 "sources": chunks,
                 "degraded": True,
             }
+
+            yield {
+                "event": "step",
+                "data": {
+                    "id": "generate",
+                    "status": "failed",
+                    "reason": "generation_error",
+                },
+            }
+            yield {"event": "result", "data": response}
+            return
+
+        yield {
+            "event": "step",
+            "data": {"id": "generate", "status": "completed"},
+        }
+
+        # 4. CHECK ANSWER
+        yield {
+            "event": "step",
+            "data": {"id": "check_answer", "status": "started"},
+        }
 
         grounding = check_grounding(answer, chunks)
 
@@ -379,6 +473,7 @@ def ask(request: Request, q: str, k: int = 3):
             )
 
             safe = "I don't have enough information to answer that accurately."
+
             trace.update(
                 output=safe,
                 metadata={
@@ -386,13 +481,35 @@ def ask(request: Request, q: str, k: int = 3):
                     "reason": grounding.get("reason", ""),
                 },
             )
-            return {
+
+            response = {
                 "question": q,
                 "answer": safe,
                 "sources": chunks,
                 "rejected": "ungrounded",
             }
 
+            yield {
+                "event": "step",
+                "data": {
+                    "id": "check_answer",
+                    "status": "completed",
+                    "outcome": "rejected",
+                },
+            }
+            yield {"event": "result", "data": response}
+            return
+
+        yield {
+            "event": "step",
+            "data": {
+                "id": "check_answer",
+                "status": "completed",
+                "outcome": "passed",
+            },
+        }
+
+        # Successful answer
         answer = redact_pii(answer)
 
         trace.update(
@@ -407,7 +524,111 @@ def ask(request: Request, q: str, k: int = 3):
         }
 
         _ASK_CACHE[cache_key] = response
-        return response
+
+        yield {"event": "result", "data": response}
+
+
+def sse_event(event: str, data: dict) -> str:
+    return (
+        f"event: {event}\n"
+        f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+    )
+
+
+def stream_ask(q: str, k: int = 3):
+    pipeline = ask_pipeline(q, k)
+    current_step = None
+    result = None
+
+    try:
+        for item in pipeline:
+            event = item["event"]
+            data = item["data"]
+
+            if event == "step":
+                if data["status"] == "started":
+                    current_step = data["id"]
+                elif data["status"] in ("completed", "failed"):
+                    current_step = None
+
+                yield sse_event("step", data)
+
+            elif event == "result":
+                result = data
+
+            else:
+                raise ValueError(f"Unexpected pipeline event: {event}")
+
+        if result is None:
+            raise RuntimeError("Pipeline ended without a result")
+
+        if "rejected" in result:
+            outcome = "rejected"
+        elif result.get("degraded"):
+            outcome = "degraded"
+        else:
+            outcome = "answered"
+
+        answer_data = {
+            "question": result["question"],
+            "answer": result["answer"],
+            "sources": result.get("sources", []),
+            "outcome": outcome,
+        }
+
+        if "rejected" in result:
+            answer_data["reason"] = result["rejected"]
+
+        if result.get("cached"):
+            answer_data["cached"] = True
+
+        yield sse_event("answer", answer_data)
+        yield sse_event("done", {"outcome": outcome})
+
+    except GeneratorExit:
+        raise
+
+    except Exception as e:
+        print(
+            f"[STREAM ERR] {type(e).__name__}: {e}",
+            flush=True,
+        )
+
+        yield sse_event(
+            "error",
+            {
+                "code": "internal_error",
+                "step": current_step or "unknown",
+            },
+        )
+
+    finally:
+        pipeline.close()
+
+
+@app.get("/ask", dependencies=[Depends(require_api_key)])
+@limiter.limit("20/minute")
+def ask(request: Request, q: str, k: int = 3):
+    result = None
+
+    for event in ask_pipeline(q, k):
+        if event["event"] == "result":
+            result = event["data"]
+
+    return result
+
+
+@app.get("/ask/stream", dependencies=[Depends(require_api_key)])
+@limiter.limit("20/minute")
+def ask_stream(request: Request, q: str, k: int = 3):
+    return StreamingResponse(
+        stream_ask(q, k),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/embed")
